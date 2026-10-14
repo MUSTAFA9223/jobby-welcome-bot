@@ -25,6 +25,7 @@ COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/JOBBYChat")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/JOBBYSOL")
 X_URL = os.getenv("X_URL", "https://x.com/JOBBYSOL")
 WEBSITE_URL = os.getenv("WEBSITE_URL", "").strip()
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
 
 DEFAULT_WELCOME = (
     "Welcome, {name}!\n\n"
@@ -78,6 +79,15 @@ def save_settings(chat_id, welcome_text=None, photo_file_id=None, set_photo=Fals
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
+
+def settings_chat_id(update: Update):
+    """Use the current group, or the configured JOBBY group when an admin uses private chat."""
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        return chat.id
+    if TARGET_CHAT_ID.lstrip("-").isdigit():
+        return int(TARGET_CHAT_ID)
+    return chat.id if chat else None
 
 def make_keyboard():
     rows = [
@@ -154,7 +164,11 @@ async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(new_text) > 900:
         await update.effective_message.reply_text("Please keep the welcome message under 900 characters.")
         return
-    save_settings(update.effective_chat.id, welcome_text=new_text)
+    chat_id = settings_chat_id(update)
+    if chat_id is None:
+        await update.effective_message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        return
+    save_settings(chat_id, welcome_text=new_text)
     await update.effective_message.reply_text("Welcome message saved for this group.")
 
 async def setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,11 +181,15 @@ async def setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reply or not reply.photo:
         await update.effective_message.reply_text(
             "Reply to a photo with /setphoto to use it as the welcome image. "
-            "Reply to a text message with /clearphoto to remove the image."
+            "You can do this in this private chat or in the group."
         )
         return
+    chat_id = settings_chat_id(update)
+    if chat_id is None:
+        await update.effective_message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        return
     save_settings(
-        update.effective_chat.id,
+        chat_id,
         photo_file_id=reply.photo[-1].file_id,
         set_photo=True,
     )
@@ -183,7 +201,11 @@ async def clearphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.effective_message.reply_text("This command is restricted to configured bot admins.")
         return
-    save_settings(update.effective_chat.id, photo_file_id=None, set_photo=True)
+    chat_id = settings_chat_id(update)
+    if chat_id is None:
+        await update.effective_message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        return
+    save_settings(chat_id, photo_file_id=None, set_photo=True)
     await update.effective_message.reply_text("Welcome image removed for this group.")
 
 async def settings_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
