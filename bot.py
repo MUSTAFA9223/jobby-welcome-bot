@@ -5,7 +5,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, ChatMemberHandler, CommandHandler, ContextTypes,
+    Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
 )
 
@@ -89,7 +89,7 @@ def settings_chat_id(update: Update):
         return int(TARGET_CHAT_ID)
     return chat.id if chat else None
 
-def make_keyboard():
+def make_keyboard(include_admin=False):
     rows = [
         [InlineKeyboardButton("Community", url=COMMUNITY_URL),
          InlineKeyboardButton("Channel", url=CHANNEL_URL)],
@@ -97,6 +97,9 @@ def make_keyboard():
     ]
     if WEBSITE_URL.startswith(("https://", "http://")):
         rows.append([InlineKeyboardButton("Website", url=WEBSITE_URL)])
+    if include_admin:
+        rows.append([InlineKeyboardButton("Admin Controls", callback_data="admin_controls"),
+                     InlineKeyboardButton("My Telegram ID", callback_data="show_myid")])
     return InlineKeyboardMarkup(rows)
 
 async def send_welcome(chat_id, member, context):
@@ -140,8 +143,32 @@ async def member_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
         await update.effective_message.reply_text(
-            "JOBBY Welcome Bot is running. Add me to your group and grant permission to send messages.\n"
-            "Use /myid to get your Telegram user ID."
+            "Welcome to JOBBY Welcome Bot.\n\n"
+            "Use the buttons below to open our community and social pages, view your Telegram ID, "
+            "or see the admin controls.",
+            reply_markup=make_keyboard(include_admin=True),
+            disable_web_page_preview=True,
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    if query.data == "show_myid":
+        user = query.from_user
+        await query.message.reply_text(f"Your Telegram user ID: {user.id}")
+    elif query.data == "admin_controls":
+        if query.from_user.id not in ADMIN_IDS:
+            await query.message.reply_text("These controls are available to configured bot admins only. Use /myid to check your ID.")
+            return
+        await query.message.reply_text(
+            "JOBBY Admin Controls\n\n"
+            "Change welcome text:\n/setwelcome Welcome, {name}! Welcome to JOBBY.\n\n"
+            "Set welcome image: send a photo, then reply to it with /setphoto.\n\n"
+            "Remove welcome image: /clearphoto\n\n"
+            "Show commands: /help",
+            disable_web_page_preview=True,
         )
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -229,6 +256,7 @@ def main():
     app.add_handler(CommandHandler("setphoto", setphoto))
     app.add_handler(CommandHandler("clearphoto", clearphoto))
     app.add_handler(CommandHandler("help", settings_help))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(ChatMemberHandler(member_status, ChatMemberHandler.CHAT_MEMBER))
     log.info("JOBBY welcome bot starting")
