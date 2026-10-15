@@ -81,12 +81,22 @@ def is_admin(update: Update) -> bool:
     return bool(user and user.id in ADMIN_IDS)
 
 def settings_chat_id(update: Update):
-    """Use the current group, or the configured JOBBY group when an admin uses private chat."""
+    """Resolve the group whose welcome settings should be edited from private admin chat."""
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         return chat.id
     if TARGET_CHAT_ID.lstrip("-").isdigit():
         return int(TARGET_CHAT_ID)
+    # If TARGET_CHAT_ID was not configured, use the most recently saved group.
+    try:
+        with connect_db() as conn:
+            row = conn.execute(
+                "SELECT chat_id FROM settings WHERE chat_id < 0 ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                return row[0]
+    except Exception:
+        log.exception("Could not resolve the configured welcome group")
     return chat.id if chat else None
 
 def make_keyboard(include_admin=False):
