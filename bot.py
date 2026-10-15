@@ -254,7 +254,7 @@ async def quick_text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE
     raw = (message.text or "").strip()
     if not raw:
         return
-    key = raw.lower().strip().strip("!?.,:;()[]{}<>\\"'“”‘’ ")
+    key = raw.lower().strip().strip("!?.,:;()[]{}<> ")
     key = key.lstrip("@#").strip()
     if key == "x":
         await message.reply_text(f"Follow JOBBY on X: {X_URL}", disable_web_page_preview=True)
