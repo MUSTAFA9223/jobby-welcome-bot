@@ -245,6 +245,53 @@ async def clearphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_settings(chat_id, photo_file_id=None, set_photo=True)
     await update.effective_message.reply_text("Welcome image removed for this group.")
 
+async def quick_text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply to exact social-link shortcuts in group chats."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or chat.type not in ("group", "supergroup"):
+        return
+    raw = (message.text or "").strip()
+    if not raw:
+        return
+    key = raw.lower().strip().strip("!?.,:;()[]{}<>\\"'“”‘’ ")
+    key = key.lstrip("@#").strip()
+    if key == "x":
+        await message.reply_text(f"Follow JOBBY on X: {X_URL}", disable_web_page_preview=True)
+    elif key == "channel":
+        await message.reply_text(f"JOBBY official channel: {CHANNEL_URL}", disable_web_page_preview=True)
+    elif key == "telegram":
+        await message.reply_text(
+            "Join JOBBY on Telegram:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Community", url=COMMUNITY_URL)],
+                [InlineKeyboardButton("Channel", url=CHANNEL_URL)],
+            ]),
+            disable_web_page_preview=True,
+        )
+    elif key == "community":
+        await message.reply_text(f"JOBBY community: {COMMUNITY_URL}", disable_web_page_preview=True)
+    elif key == "links":
+        rows = [
+            [InlineKeyboardButton("Community", url=COMMUNITY_URL),
+             InlineKeyboardButton("Channel", url=CHANNEL_URL)],
+            [InlineKeyboardButton("Follow JOBBY on X", url=X_URL)],
+        ]
+        if WEBSITE_URL.startswith(("https://", "http://")):
+            rows.append([InlineKeyboardButton("Website", url=WEBSITE_URL)])
+        await message.reply_text(
+            "Official JOBBY links:",
+            reply_markup=InlineKeyboardMarkup(rows),
+            disable_web_page_preview=True,
+        )
+    elif key == "ca":
+        await message.reply_text("SOON")
+    elif key == "web":
+        if WEBSITE_URL.startswith(("https://", "http://")):
+            await message.reply_text(f"JOBBY website: {WEBSITE_URL}", disable_web_page_preview=True)
+        else:
+            await message.reply_text("The JOBBY website link has not been configured yet.")
+
 async def settings_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
         await update.effective_message.reply_text(
@@ -267,6 +314,7 @@ def main():
     app.add_handler(CommandHandler("clearphoto", clearphoto))
     app.add_handler(CommandHandler("help", settings_help))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quick_text_triggers))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(ChatMemberHandler(member_status, ChatMemberHandler.CHAT_MEMBER))
     log.info("JOBBY welcome bot starting")
