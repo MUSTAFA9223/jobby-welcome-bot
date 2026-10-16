@@ -2,6 +2,7 @@ import html
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -79,6 +80,14 @@ def connect_db():
             config_value TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS shortcuts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            response_text TEXT NOT NULL,
+            response_html TEXT
+        )
+    """)
     # Upgrade only the original stock message; preserve admin-customized text.
     conn.execute(
         "UPDATE settings SET welcome_text=? WHERE welcome_text=?",
@@ -86,6 +95,40 @@ def connect_db():
     )
     conn.commit()
     return conn
+
+def normalize_trigger(value):
+    return value.casefold().strip().strip("!?.,:;()[]{}<> ").lstrip("@#").strip()
+
+def list_shortcuts():
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT id, trigger, response_text, response_html "
+            "FROM shortcuts ORDER BY trigger COLLATE NOCASE"
+        ).fetchall()
+
+def get_shortcut(trigger):
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT response_text, response_html FROM shortcuts "
+            "WHERE trigger=? COLLATE NOCASE",
+            (normalize_trigger(trigger),),
+        ).fetchone()
+
+def save_shortcut(trigger, response_text, response_html):
+    normalized = normalize_trigger(trigger)
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO shortcuts(trigger, response_text, response_html) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(trigger) DO UPDATE SET "
+            "response_text=excluded.response_text, response_html=excluded.response_html",
+            (normalized, response_text, response_html),
+        )
+
+def delete_shortcut(shortcut_id):
+    with connect_db() as conn:
+        cursor = conn.execute("DELETE FROM shortcuts WHERE id=?", (shortcut_id,))
+        return cursor.rowcount > 0
 
 def _legacy_target_id(conn):
     row = conn.execute(
@@ -269,7 +312,46 @@ def admin_keyboard():
         [InlineKeyboardButton("✏️ Edit welcome template", callback_data="admin_edit_text")],
         [InlineKeyboardButton("🔗 Official links", callback_data="admin_links")],
         [InlineKeyboardButton("🖼 Welcome image", callback_data="admin_image")],
+        [InlineKeyboardButton("⚡ Custom shortcuts", callback_data="admin_shortcuts")],
     ])
+
+def admin_shortcuts_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add shortcut", callback_data="admin_shortcut_add")],
+        [InlineKeyboardButton("🗑 Delete shortcut", callback_data="admin_shortcut_delete_menu")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
+    ])
+
+def shortcut_delete_keyboard(shortcuts):
+    rows = [
+        [InlineKeyboardButton(
+            f"🗑 {trigger[:40]}", callback_data=f"admin_shortcut_delete:{shortcut_id}"
+        )]
+        for shortcut_id, trigger, _, _ in shortcuts[:40]
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_shortcuts")])
+    return InlineKeyboardMarkup(rows)
+
+def shortcut_panel_text():
+    shortcuts = list_shortcuts()
+    lines = [
+        "⚡ Custom shortcuts",
+        "",
+        "Add an exact word or phrase and its reply. It will work in every group.",
+        "",
+    ]
+    if not shortcuts:
+        lines.append("No custom shortcuts yet.")
+    else:
+        lines.append(f"Configured: {len(shortcuts)}")
+        for _, trigger, response_text, _ in shortcuts[:30]:
+            preview = response_text.replace("\n", " ")
+            if len(preview) > 55:
+                preview = preview[:52] + "..."
+            lines.append(f"• {trigger} → {preview}")
+        if len(shortcuts) > 30:
+            lines.append(f"…and {len(shortcuts) - 30} more")
+    return "\n".join(lines)
 
 def admin_links_keyboard():
     return InlineKeyboardMarkup([
@@ -293,6 +375,7 @@ def admin_panel_text():
         "Bot status: ONLINE\n"
         "Welcome messages: ON\n"
         "Publishing: ALL GROUPS ✅\n"
+        f"Custom shortcuts: {len(list_shortcuts())}\n"
         f"Authorized admins: {len(ADMIN_IDS)}\n\n"
         "Edit once here; every group will use the same welcome."
     )
@@ -309,6 +392,20 @@ def render_welcome(welcome_text, welcome_html, member):
     return message, None
 
 async def send_welcome(chat_id, member, context):
+    # Telegram can report the same join through both a service message and
+    # a chat-member update. Suppress the second event for the same member.
+    now = time.monotonic()
+    dedupe = context.bot_data.setdefault("welcome_dedupe", {})
+    dedupe_key = (chat_id, member.id)
+    last_sent = dedupe.get(dedupe_key)
+    if last_sent is not None and now - last_sent < 45:
+        log.info("Skipped duplicate welcome for member %s in chat %s", member.id, chat_id)
+        return
+    if len(dedupe) > 1000:
+        expired = [key for key, sent_at in dedupe.items() if now - sent_at > 3600]
+        for key in expired:
+            dedupe.pop(key, None)
+
     welcome_text, welcome_html, photo_id = get_settings(chat_id)
     message, parse_mode = render_welcome(welcome_text, welcome_html, member)
     keyboard = make_keyboard(chat_id)
@@ -329,6 +426,7 @@ async def send_welcome(chat_id, member, context):
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
+        dedupe[dedupe_key] = time.monotonic()
     except Exception:
         log.exception("Could not send welcome message in chat %s", chat_id)
 
@@ -423,6 +521,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
     elif data == "admin_preview":
         await send_admin_preview(update, context)
+    elif data == "admin_shortcuts":
+        context.user_data.pop("admin_action", None)
+        await query.message.reply_text(
+            shortcut_panel_text(), reply_markup=admin_shortcuts_keyboard()
+        )
+    elif data == "admin_shortcut_add":
+        context.user_data["admin_action"] = "shortcut_trigger"
+        context.user_data.pop("new_shortcut_trigger", None)
+        await query.message.reply_text(
+            "➕ Add shortcut\n\n"
+            "Send the exact word or phrase members will type in a group.\n"
+            "Example: discord\n\nSend /cancel to stop."
+        )
+    elif data == "admin_shortcut_delete_menu":
+        shortcuts = list_shortcuts()
+        if not shortcuts:
+            await query.message.reply_text(
+                "No custom shortcuts to delete.", reply_markup=admin_shortcuts_keyboard()
+            )
+        else:
+            await query.message.reply_text(
+                "Choose a shortcut to delete:",
+                reply_markup=shortcut_delete_keyboard(shortcuts),
+            )
+    elif data.startswith("admin_shortcut_delete:"):
+        try:
+            shortcut_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        deleted = delete_shortcut(shortcut_id)
+        await query.message.reply_text(
+            "Shortcut deleted ✅" if deleted else "Shortcut was already deleted.",
+            reply_markup=admin_shortcuts_keyboard(),
+        )
     elif data == "admin_edit_text":
         context.user_data["admin_action"] = "edit_welcome"
         await query.message.reply_text(
@@ -504,7 +636,45 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not action:
         return
     value = (message.text or "").strip()
-    if action == "edit_welcome":
+    if action == "shortcut_trigger":
+        trigger = normalize_trigger(value)
+        if not trigger or "\n" in trigger:
+            await message.reply_text("Send one word or phrase on a single line.")
+            return
+        if len(trigger) > 60:
+            await message.reply_text("Please keep the shortcut under 60 characters.")
+            return
+        context.user_data["new_shortcut_trigger"] = trigger
+        context.user_data["admin_action"] = "shortcut_response"
+        await message.reply_text(
+            f"Shortcut: {trigger}\n\n"
+            "Now send the reply exactly as you want it to appear. "
+            "Formatting and animated emoji are supported.\n\nSend /cancel to stop."
+        )
+    elif action == "shortcut_response":
+        trigger = context.user_data.get("new_shortcut_trigger")
+        if not trigger:
+            context.user_data.pop("admin_action", None)
+            await message.reply_text(
+                "The shortcut setup expired. Start again from Custom shortcuts.",
+                reply_markup=admin_keyboard(),
+            )
+            return
+        if not value:
+            await message.reply_text("The reply cannot be empty.")
+            return
+        if len(value) > 1000:
+            await message.reply_text("Please keep the reply under 1000 characters.")
+            return
+        formatted = (message.text_html or value).strip()
+        save_shortcut(trigger, value, formatted)
+        context.user_data.pop("admin_action", None)
+        context.user_data.pop("new_shortcut_trigger", None)
+        await message.reply_text(
+            f"Shortcut “{trigger}” saved for all groups ✅",
+            reply_markup=admin_shortcuts_keyboard(),
+        )
+    elif action == "edit_welcome":
         if len(value) > 1000:
             await message.reply_text("Please keep the welcome message under 1000 characters.")
             return
@@ -623,8 +793,17 @@ async def quick_text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE
     raw = (message.text or "").strip()
     if not raw:
         return
-    key = raw.lower().strip().strip("!?.,:;()[]{}<> ")
-    key = key.lstrip("@#").strip()
+    key = normalize_trigger(raw)
+    custom_shortcut = get_shortcut(key)
+    if custom_shortcut:
+        response_text, response_html = custom_shortcut
+        await message.reply_text(
+            response_html or response_text,
+            parse_mode="HTML" if response_html else None,
+            disable_web_page_preview=True,
+        )
+        return
+
     COMMUNITY_URL, CHANNEL_URL, X_URL, WEBSITE_URL = get_links(chat.id)
     if key == "x":
         await message.reply_text(f"Follow JOBBY on X: {X_URL}", disable_web_page_preview=True)
