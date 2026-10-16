@@ -4,7 +4,15 @@ import os
 import sqlite3
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestChat,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
@@ -27,6 +35,7 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/JOBBYSOL")
 X_URL = os.getenv("X_URL", "https://x.com/JOBBYSOL")
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://jobby.lol").strip() or "https://jobby.lol"
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
+GROUP_PICKER_REQUEST_ID = 64001
 
 LEGACY_DEFAULT_WELCOME = (
     "Welcome, {name}!\n\n"
@@ -212,6 +221,7 @@ def make_keyboard(chat_id=None):
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Select JOBBY group", callback_data="admin_select_group")],
         [InlineKeyboardButton("👁 Preview welcome", callback_data="admin_preview")],
         [InlineKeyboardButton("✏️ Edit welcome template", callback_data="admin_edit_text")],
         [InlineKeyboardButton("🔗 Official links", callback_data="admin_links")],
@@ -235,13 +245,14 @@ def admin_image_keyboard():
     ])
 
 def admin_panel_text():
+    target_status = "SELECTED ✅" if configured_group_id() is not None else "NOT SELECTED"
     return (
         "🔐 JOBBY ADMIN\n\n"
         "Bot status: ONLINE\n"
         "Welcome messages: ON\n"
+        f"Target group: {target_status}\n"
         f"Authorized admins: {len(ADMIN_IDS)}\n\n"
-        "Quick text triggers in groups: X, channel, telegram, community, links, CA, web.\n\n"
-        "For normal-word triggers, Telegram BotFather privacy mode must be disabled."
+        "All welcome settings can be changed here inside the bot."
     )
 
 def render_welcome(welcome_text, welcome_html, member):
@@ -323,7 +334,7 @@ async def send_admin_preview(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = settings_chat_id(update)
     if chat_id is None:
         await query.message.reply_text(
-            "No target group is connected. Send /bind once inside the JOBBY group."
+            "No target group selected. Tap 🎯 Select JOBBY group in the admin panel."
         )
         return
     welcome_text, welcome_html, photo_id = get_settings(chat_id)
@@ -368,6 +379,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("admin_controls", "admin_back"):
         context.user_data.pop("admin_action", None)
         await query.message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
+    elif data == "admin_select_group":
+        picker = KeyboardButton(
+            "🎯 Choose JOBBY group",
+            request_chat=KeyboardButtonRequestChat(
+                request_id=GROUP_PICKER_REQUEST_ID,
+                chat_is_channel=False,
+                bot_is_member=True,
+            ),
+        )
+        await query.message.reply_text(
+            "Tap the button below, then choose the JOBBY group.\n"
+            "You will not need to leave this bot.",
+            reply_markup=ReplyKeyboardMarkup(
+                [[picker]], resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
     elif data == "admin_preview":
         await send_admin_preview(update, context)
     elif data == "admin_edit_text":
@@ -381,7 +408,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_links":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+            await query.message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
             return
         group_url, channel_url, x_url, website_url = get_links(chat_id)
         await query.message.reply_text(
@@ -411,7 +438,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_image":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+            await query.message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
             return
         _, _, photo_id = get_settings(chat_id)
         status = "SET ✅" if photo_id else "NOT SET"
@@ -427,7 +454,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_image_clear":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+            await query.message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
             return
         save_settings(chat_id, photo_file_id=None, set_photo=True)
         context.user_data.pop("admin_action", None)
@@ -457,7 +484,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+            await message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
             return
         formatted = (message.text_html or value).strip()
         save_settings(chat_id, welcome_text=value, welcome_html=formatted)
@@ -471,7 +498,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+            await message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
             return
         link_name = action.split(":", 1)[1]
         save_link(chat_id, link_name, value)
@@ -488,7 +515,7 @@ async def admin_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+        await message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
         return
     save_settings(chat_id, photo_file_id=message.photo[-1].file_id, set_photo=True)
     context.user_data.pop("admin_action", None)
@@ -496,21 +523,30 @@ async def admin_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome image saved ✅", reply_markup=admin_keyboard()
     )
 
-async def bind_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def selected_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    chat = update.effective_chat
-    if not message or not chat:
+    if not message or not message.chat_shared or not is_admin(update):
         return
-    if not is_admin(update):
-        await message.reply_text("This command is restricted to configured bot admins.")
+    shared = message.chat_shared
+    if shared.request_id != GROUP_PICKER_REQUEST_ID:
         return
-    if chat.type not in ("group", "supergroup"):
-        await message.reply_text("Send /bind inside the JOBBY group.")
+    try:
+        chosen_chat = await context.bot.get_chat(shared.chat_id)
+    except Exception:
+        log.exception("Could not access selected target group %s", shared.chat_id)
+        await message.reply_text(
+            "I could not access that group. Add this bot to the group, then select it again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
-    remember_group(chat.id)
+    remember_group(shared.chat_id)
+    context.user_data.pop("admin_action", None)
+    title = chosen_chat.title or str(shared.chat_id)
     await message.reply_text(
-        "This group is now connected to the private admin panel ✅"
+        f"Target group selected: {title} ✅",
+        reply_markup=ReplyKeyboardRemove(),
     )
+    await message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message and update.effective_user:
@@ -534,7 +570,7 @@ async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+        await update.effective_message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
         return
     save_settings(chat_id, welcome_text=new_text)
     await update.effective_message.reply_text("Welcome message saved for this group.")
@@ -554,7 +590,7 @@ async def setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+        await update.effective_message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
         return
     save_settings(
         chat_id,
@@ -571,7 +607,7 @@ async def clearphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
+        await update.effective_message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
         return
     save_settings(chat_id, photo_file_id=None, set_photo=True)
     await update.effective_message.reply_text("Welcome image removed for this group.")
@@ -641,7 +677,6 @@ def main():
     connect_db().close()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("bind", bind_group))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("setwelcome", setwelcome))
     app.add_handler(CommandHandler("setphoto", setphoto))
@@ -649,6 +684,9 @@ def main():
     app.add_handler(CommandHandler("help", settings_help))
     app.add_handler(CommandHandler("cancel", cancel_admin_action))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.CHAT_SHARED, selected_group
+    ))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.PHOTO, admin_photo_input
     ))
