@@ -1,3 +1,4 @@
+import html
 import logging
 import os
 import sqlite3
@@ -53,9 +54,15 @@ def connect_db():
         CREATE TABLE IF NOT EXISTS settings (
             chat_id INTEGER PRIMARY KEY,
             welcome_text TEXT NOT NULL,
-            photo_file_id TEXT
+            photo_file_id TEXT,
+            welcome_html TEXT
         )
     """)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(settings)").fetchall()
+    }
+    if "welcome_html" not in columns:
+        conn.execute("ALTER TABLE settings ADD COLUMN welcome_html TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS links (
             chat_id INTEGER PRIMARY KEY,
@@ -63,6 +70,12 @@ def connect_db():
             channel_url TEXT NOT NULL,
             x_url TEXT NOT NULL,
             website_url TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_config (
+            config_key TEXT PRIMARY KEY,
+            config_value TEXT NOT NULL
         )
     """)
     # Upgrade only the original stock message; preserve admin-customized text.
@@ -76,30 +89,37 @@ def connect_db():
 def get_settings(chat_id):
     with connect_db() as conn:
         row = conn.execute(
-            "SELECT welcome_text, photo_file_id FROM settings WHERE chat_id=?",
+            "SELECT welcome_text, welcome_html, photo_file_id FROM settings WHERE chat_id=?",
             (chat_id,),
         ).fetchone()
         if row:
-            return row[0], row[1]
+            return row[0], row[1], row[2]
         conn.execute(
-            "INSERT OR IGNORE INTO settings(chat_id, welcome_text, photo_file_id) VALUES(?,?,?)",
-            (chat_id, DEFAULT_WELCOME, None),
+            "INSERT OR IGNORE INTO settings"
+            "(chat_id, welcome_text, welcome_html, photo_file_id) VALUES(?,?,?,?)",
+            (chat_id, DEFAULT_WELCOME, None, None),
         )
         conn.commit()
-        return DEFAULT_WELCOME, None
+        return DEFAULT_WELCOME, None, None
 
-def save_settings(chat_id, welcome_text=None, photo_file_id=None, set_photo=False):
-    text, photo = get_settings(chat_id)
+def save_settings(
+    chat_id, welcome_text=None, welcome_html=None, photo_file_id=None, set_photo=False
+):
+    text, formatted, photo = get_settings(chat_id)
     if welcome_text is not None:
         text = welcome_text
+        formatted = welcome_html
     if set_photo:
         photo = photo_file_id
     with connect_db() as conn:
         conn.execute(
-            "INSERT INTO settings(chat_id, welcome_text, photo_file_id) VALUES(?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET welcome_text=excluded.welcome_text, "
+            "INSERT INTO settings(chat_id, welcome_text, welcome_html, photo_file_id) "
+            "VALUES(?,?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "welcome_text=excluded.welcome_text, "
+            "welcome_html=excluded.welcome_html, "
             "photo_file_id=excluded.photo_file_id",
-            (chat_id, text, photo),
+            (chat_id, text, formatted, photo),
         )
         conn.commit()
 
@@ -139,24 +159,42 @@ def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
 
-def settings_chat_id(update: Update):
-    """Resolve the group whose welcome settings should be edited from private admin chat."""
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        return chat.id
+def remember_group(chat_id):
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        return
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO bot_config(config_key, config_value) VALUES('target_chat_id', ?) "
+            "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
+            (str(chat_id),),
+        )
+        conn.commit()
+    get_settings(chat_id)
+    get_links(chat_id)
+
+def configured_group_id():
     if TARGET_CHAT_ID.lstrip("-").isdigit():
         return int(TARGET_CHAT_ID)
-    # If TARGET_CHAT_ID was not configured, use the most recently saved group.
-    try:
-        with connect_db() as conn:
-            row = conn.execute(
-                "SELECT chat_id FROM settings WHERE chat_id < 0 ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                return row[0]
-    except Exception:
-        log.exception("Could not resolve the configured welcome group")
-    return chat.id if chat else None
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT config_value FROM bot_config WHERE config_key='target_chat_id'"
+        ).fetchone()
+        if row and str(row[0]).lstrip("-").isdigit():
+            return int(row[0])
+        row = conn.execute(
+            "SELECT chat_id FROM settings WHERE chat_id < 0 ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return row[0]
+    return None
+
+def settings_chat_id(update: Update):
+    """Resolve the group edited from the private admin panel."""
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        remember_group(chat.id)
+        return chat.id
+    return configured_group_id()
 
 def make_keyboard(chat_id=None):
     if chat_id is None:
@@ -206,20 +244,36 @@ def admin_panel_text():
         "For normal-word triggers, Telegram BotFather privacy mode must be disabled."
     )
 
-async def send_welcome(chat_id, member, context):
-    welcome_text, photo_id = get_settings(chat_id)
+def render_welcome(welcome_text, welcome_html, member):
     name = member.full_name or member.first_name or "there"
-    message = welcome_text.replace("{name}", name).replace("{username}", ("@" + member.username) if member.username else name)
+    username = ("@" + member.username) if member.username else name
+    if welcome_html:
+        message = welcome_html.replace("{name}", html.escape(name)).replace(
+            "{username}", html.escape(username)
+        )
+        return message, "HTML"
+    message = welcome_text.replace("{name}", name).replace("{username}", username)
+    return message, None
+
+async def send_welcome(chat_id, member, context):
+    welcome_text, welcome_html, photo_id = get_settings(chat_id)
+    message, parse_mode = render_welcome(welcome_text, welcome_html, member)
     keyboard = make_keyboard(chat_id)
     try:
         if photo_id:
             await context.bot.send_photo(
-                chat_id=chat_id, photo=photo_id, caption=message,
+                chat_id=chat_id,
+                photo=photo_id,
+                caption=message,
+                parse_mode=parse_mode,
                 reply_markup=keyboard,
             )
         else:
             await context.bot.send_message(
-                chat_id=chat_id, text=message, reply_markup=keyboard,
+                chat_id=chat_id,
+                text=message,
+                parse_mode=parse_mode,
+                reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
     except Exception:
@@ -229,6 +283,7 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
         return
+    remember_group(message.chat_id)
     for member in message.new_chat_members or []:
         if context.bot and member.id == context.bot.id:
             continue
@@ -236,13 +291,17 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def member_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     change = update.chat_member
-    if not change:
+    chat = update.effective_chat
+    if not change or not chat:
         return
+    remember_group(chat.id)
     old = change.old_chat_member
     new = change.new_chat_member
-    if old.status in ("left", "kicked") and new.status in ("member", "administrator", "creator"):
+    if old.status in ("left", "kicked") and new.status in (
+        "member", "administrator", "creator"
+    ):
         if context.bot and new.user.id != context.bot.id:
-            await send_welcome(update.effective_chat.id, new.user, context)
+            await send_welcome(chat.id, new.user, context)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -263,24 +322,28 @@ async def send_admin_preview(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        await query.message.reply_text(
+            "No target group is connected. Send /bind once inside the JOBBY group."
+        )
         return
-    welcome_text, photo_id = get_settings(chat_id)
-    preview_name = query.from_user.full_name or "New Member"
-    preview_username = (
-        "@" + query.from_user.username if query.from_user.username else preview_name
-    )
-    preview = welcome_text.replace("{name}", preview_name).replace(
-        "{username}", preview_username
+    welcome_text, welcome_html, photo_id = get_settings(chat_id)
+    preview, parse_mode = render_welcome(
+        welcome_text, welcome_html, query.from_user
     )
     keyboard = make_keyboard(chat_id)
     if photo_id:
         await query.message.reply_photo(
-            photo=photo_id, caption=preview, reply_markup=keyboard
+            photo=photo_id,
+            caption=preview,
+            parse_mode=parse_mode,
+            reply_markup=keyboard,
         )
     else:
         await query.message.reply_text(
-            preview, reply_markup=keyboard, disable_web_page_preview=True
+            preview,
+            parse_mode=parse_mode,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
         )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,7 +381,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_links":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            await query.message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
             return
         group_url, channel_url, x_url, website_url = get_links(chat_id)
         await query.message.reply_text(
@@ -348,9 +411,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_image":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            await query.message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
             return
-        _, photo_id = get_settings(chat_id)
+        _, _, photo_id = get_settings(chat_id)
         status = "SET ✅" if photo_id else "NOT SET"
         await query.message.reply_text(
             f"🖼 Welcome image\n\nCurrent status: {status}",
@@ -364,7 +427,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_image_clear":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            await query.message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
             return
         save_settings(chat_id, photo_file_id=None, set_photo=True)
         context.user_data.pop("admin_action", None)
@@ -394,9 +457,10 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            await message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
             return
-        save_settings(chat_id, welcome_text=value)
+        formatted = (message.text_html or value).strip()
+        save_settings(chat_id, welcome_text=value, welcome_html=formatted)
         context.user_data.pop("admin_action", None)
         await message.reply_text(
             "Welcome template saved ✅", reply_markup=admin_keyboard()
@@ -407,7 +471,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            await message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
             return
         link_name = action.split(":", 1)[1]
         save_link(chat_id, link_name, value)
@@ -424,12 +488,28 @@ async def admin_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        await message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
         return
     save_settings(chat_id, photo_file_id=message.photo[-1].file_id, set_photo=True)
     context.user_data.pop("admin_action", None)
     await message.reply_text(
         "Welcome image saved ✅", reply_markup=admin_keyboard()
+    )
+
+async def bind_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+    if not is_admin(update):
+        await message.reply_text("This command is restricted to configured bot admins.")
+        return
+    if chat.type not in ("group", "supergroup"):
+        await message.reply_text("Send /bind inside the JOBBY group.")
+        return
+    remember_group(chat.id)
+    await message.reply_text(
+        "This group is now connected to the private admin panel ✅"
     )
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -454,7 +534,7 @@ async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        await update.effective_message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
         return
     save_settings(chat_id, welcome_text=new_text)
     await update.effective_message.reply_text("Welcome message saved for this group.")
@@ -474,7 +554,7 @@ async def setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        await update.effective_message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
         return
     save_settings(
         chat_id,
@@ -491,7 +571,7 @@ async def clearphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        await update.effective_message.reply_text("No target group is connected. Send /bind once inside the JOBBY group.")
         return
     save_settings(chat_id, photo_file_id=None, set_photo=True)
     await update.effective_message.reply_text("Welcome image removed for this group.")
@@ -502,6 +582,7 @@ async def quick_text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = update.effective_chat
     if not message or not chat or chat.type not in ("group", "supergroup"):
         return
+    remember_group(chat.id)
     raw = (message.text or "").strip()
     if not raw:
         return
@@ -560,6 +641,7 @@ def main():
     connect_db().close()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("bind", bind_group))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("setwelcome", setwelcome))
     app.add_handler(CommandHandler("setphoto", setphoto))
