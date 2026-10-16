@@ -24,13 +24,26 @@ ADMIN_IDS = {
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/JOBBYChat")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/JOBBYSOL")
 X_URL = os.getenv("X_URL", "https://x.com/JOBBYSOL")
-WEBSITE_URL = os.getenv("WEBSITE_URL", "").strip()
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://jobby.lol").strip() or "https://jobby.lol"
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
 
-DEFAULT_WELCOME = (
+LEGACY_DEFAULT_WELCOME = (
     "Welcome, {name}!\n\n"
     "You’re now part of the JOBBY community. Join the conversation, "
     "share your ideas, and have fun with us."
+)
+
+DEFAULT_WELCOME = (
+    "Welcome to JOBBY\n\n"
+    "No lore. Just JOBBY.\n"
+    "Meme him. Remix him. Put him anywhere.\n\n"
+    "Drop a meme, say hello and join the chaos.\n"
+    "$JOBBY on Solana · Launching soon.\n\n"
+    "Official links:\n"
+    "🌐: https://jobby.lol\n"
+    "𝕏: https://x.com/JOBBYSOL\n"
+    "✈️: https://t.me/JOBBYSOL\n\n"
+    "Admins will never DM you first or ask for your seed phrase."
 )
 
 def connect_db():
@@ -43,6 +56,11 @@ def connect_db():
             photo_file_id TEXT
         )
     """)
+    # Upgrade only the original stock message; preserve admin-customized text.
+    conn.execute(
+        "UPDATE settings SET welcome_text=? WHERE welcome_text=?",
+        (DEFAULT_WELCOME, LEGACY_DEFAULT_WELCOME),
+    )
     conn.commit()
     return conn
 
@@ -101,12 +119,11 @@ def settings_chat_id(update: Update):
 
 def make_keyboard(include_admin=False):
     rows = [
-        [InlineKeyboardButton("Community", url=COMMUNITY_URL),
-         InlineKeyboardButton("Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton("Follow JOBBY on X", url=X_URL)],
+        [InlineKeyboardButton("X ↗", url=X_URL),
+         InlineKeyboardButton("Channel ↗", url=CHANNEL_URL),
+         InlineKeyboardButton("Group ↗", url=COMMUNITY_URL)],
+        [InlineKeyboardButton("Website ↗", url=WEBSITE_URL)],
     ]
-    if WEBSITE_URL.startswith(("https://", "http://")):
-        rows.append([InlineKeyboardButton("Website", url=WEBSITE_URL)])
     if include_admin:
         rows.append([InlineKeyboardButton("Admin Controls", callback_data="admin_controls"),
                      InlineKeyboardButton("My Telegram ID", callback_data="show_myid")])
