@@ -56,6 +56,15 @@ def connect_db():
             photo_file_id TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS links (
+            chat_id INTEGER PRIMARY KEY,
+            community_url TEXT NOT NULL,
+            channel_url TEXT NOT NULL,
+            x_url TEXT NOT NULL,
+            website_url TEXT NOT NULL
+        )
+    """)
     # Upgrade only the original stock message; preserve admin-customized text.
     conn.execute(
         "UPDATE settings SET welcome_text=? WHERE welcome_text=?",
@@ -94,6 +103,38 @@ def save_settings(chat_id, welcome_text=None, photo_file_id=None, set_photo=Fals
         )
         conn.commit()
 
+def get_links(chat_id):
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT community_url, channel_url, x_url, website_url FROM links WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        if row:
+            return row
+        defaults = (COMMUNITY_URL, CHANNEL_URL, X_URL, WEBSITE_URL)
+        conn.execute(
+            "INSERT OR IGNORE INTO links(chat_id, community_url, channel_url, x_url, website_url) "
+            "VALUES(?,?,?,?,?)",
+            (chat_id, *defaults),
+        )
+        conn.commit()
+        return defaults
+
+def save_link(chat_id, link_name, url):
+    columns = {
+        "group": "community_url",
+        "channel": "channel_url",
+        "x": "x_url",
+        "website": "website_url",
+    }
+    column = columns.get(link_name)
+    if not column:
+        raise ValueError("Unknown link name")
+    get_links(chat_id)
+    with connect_db() as conn:
+        conn.execute(f"UPDATE links SET {column}=? WHERE chat_id=?", (url, chat_id))
+        conn.commit()
+
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
@@ -117,23 +158,59 @@ def settings_chat_id(update: Update):
         log.exception("Could not resolve the configured welcome group")
     return chat.id if chat else None
 
-def make_keyboard(include_admin=False):
-    rows = [
-        [InlineKeyboardButton("X ↗", url=X_URL),
-         InlineKeyboardButton("Channel ↗", url=CHANNEL_URL),
-         InlineKeyboardButton("Group ↗", url=COMMUNITY_URL)],
-        [InlineKeyboardButton("Website ↗", url=WEBSITE_URL)],
-    ]
-    if include_admin:
-        rows.append([InlineKeyboardButton("Admin Controls", callback_data="admin_controls"),
-                     InlineKeyboardButton("My Telegram ID", callback_data="show_myid")])
-    return InlineKeyboardMarkup(rows)
+def make_keyboard(chat_id=None):
+    if chat_id is None:
+        community_url, channel_url, x_url, website_url = (
+            COMMUNITY_URL, CHANNEL_URL, X_URL, WEBSITE_URL
+        )
+    else:
+        community_url, channel_url, x_url, website_url = get_links(chat_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("X ↗", url=x_url),
+         InlineKeyboardButton("Channel ↗", url=channel_url),
+         InlineKeyboardButton("Group ↗", url=community_url)],
+        [InlineKeyboardButton("Website ↗", url=website_url)],
+    ])
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👁 Preview welcome", callback_data="admin_preview")],
+        [InlineKeyboardButton("✏️ Edit welcome template", callback_data="admin_edit_text")],
+        [InlineKeyboardButton("🔗 Official links", callback_data="admin_links")],
+        [InlineKeyboardButton("🖼 Welcome image", callback_data="admin_image")],
+    ])
+
+def admin_links_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("𝕏 X", callback_data="admin_edit_link:x"),
+         InlineKeyboardButton("📢 Channel", callback_data="admin_edit_link:channel")],
+        [InlineKeyboardButton("👥 Group", callback_data="admin_edit_link:group"),
+         InlineKeyboardButton("🌐 Website", callback_data="admin_edit_link:website")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
+    ])
+
+def admin_image_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Upload new image", callback_data="admin_image_set")],
+        [InlineKeyboardButton("🗑 Remove image", callback_data="admin_image_clear")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
+    ])
+
+def admin_panel_text():
+    return (
+        "🔐 JOBBY ADMIN\n\n"
+        "Bot status: ONLINE\n"
+        "Welcome messages: ON\n"
+        f"Authorized admins: {len(ADMIN_IDS)}\n\n"
+        "Quick text triggers in groups: X, channel, telegram, community, links, CA, web.\n\n"
+        "For normal-word triggers, Telegram BotFather privacy mode must be disabled."
+    )
 
 async def send_welcome(chat_id, member, context):
     welcome_text, photo_id = get_settings(chat_id)
     name = member.full_name or member.first_name or "there"
     message = welcome_text.replace("{name}", name).replace("{username}", ("@" + member.username) if member.username else name)
-    keyboard = make_keyboard()
+    keyboard = make_keyboard(chat_id)
     try:
         if photo_id:
             await context.bot.send_photo(
@@ -168,13 +245,42 @@ async def member_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_welcome(update.effective_chat.id, new.user, context)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Welcome to JOBBY Welcome Bot.\n\n"
-            "Use the buttons below to open our community and social pages, view your Telegram ID, "
-            "or see the admin controls.",
-            reply_markup=make_keyboard(include_admin=True),
-            disable_web_page_preview=True,
+    message = update.effective_message
+    if not message:
+        return
+    if is_admin(update):
+        context.user_data.pop("admin_action", None)
+        await message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
+        return
+    await message.reply_text(
+        "Welcome to JOBBY Welcome Bot.\n\n"
+        "Use the buttons below to open our community and official pages.",
+        reply_markup=make_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+async def send_admin_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = settings_chat_id(update)
+    if chat_id is None:
+        await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        return
+    welcome_text, photo_id = get_settings(chat_id)
+    preview_name = query.from_user.full_name or "New Member"
+    preview_username = (
+        "@" + query.from_user.username if query.from_user.username else preview_name
+    )
+    preview = welcome_text.replace("{name}", preview_name).replace(
+        "{username}", preview_username
+    )
+    keyboard = make_keyboard(chat_id)
+    if photo_id:
+        await query.message.reply_photo(
+            photo=photo_id, caption=preview, reply_markup=keyboard
+        )
+    else:
+        await query.message.reply_text(
+            preview, reply_markup=keyboard, disable_web_page_preview=True
         )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,21 +288,149 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
     await query.answer()
-    if query.data == "show_myid":
-        user = query.from_user
-        await query.message.reply_text(f"Your Telegram user ID: {user.id}")
-    elif query.data == "admin_controls":
-        if query.from_user.id not in ADMIN_IDS:
-            await query.message.reply_text("These controls are available to configured bot admins only. Use /myid to check your ID.")
-            return
+    data = query.data or ""
+
+    if data == "show_myid":
+        await query.message.reply_text(f"Your Telegram user ID: {query.from_user.id}")
+        return
+
+    if not data.startswith("admin_"):
+        return
+    if query.from_user.id not in ADMIN_IDS:
         await query.message.reply_text(
-            "JOBBY Admin Controls\n\n"
-            "Change welcome text:\n/setwelcome Welcome, {name}! Welcome to JOBBY.\n\n"
-            "Set welcome image: send a photo, then reply to it with /setphoto.\n\n"
-            "Remove welcome image: /clearphoto\n\n"
-            "Show commands: /help",
+            "These controls are available to configured bot admins only. Use /myid to check your ID."
+        )
+        return
+
+    if data in ("admin_controls", "admin_back"):
+        context.user_data.pop("admin_action", None)
+        await query.message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
+    elif data == "admin_preview":
+        await send_admin_preview(update, context)
+    elif data == "admin_edit_text":
+        context.user_data["admin_action"] = "edit_welcome"
+        await query.message.reply_text(
+            "✏️ Edit the full welcome template\n\n"
+            "Send the complete message exactly as you want it to appear.\n"
+            "Use {name} for the member name and {username} for their username.\n\n"
+            "Send /cancel to stop."
+        )
+    elif data == "admin_links":
+        chat_id = settings_chat_id(update)
+        if chat_id is None:
+            await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            return
+        group_url, channel_url, x_url, website_url = get_links(chat_id)
+        await query.message.reply_text(
+            "🔗 Official links\n\n"
+            f"X: {x_url}\n"
+            f"Channel: {channel_url}\n"
+            f"Group: {group_url}\n"
+            f"Website: {website_url}\n\n"
+            "Choose the link you want to edit:",
+            reply_markup=admin_links_keyboard(),
             disable_web_page_preview=True,
         )
+    elif data.startswith("admin_edit_link:"):
+        link_name = data.split(":", 1)[1]
+        labels = {
+            "x": "X",
+            "channel": "Channel",
+            "group": "Group",
+            "website": "Website",
+        }
+        if link_name not in labels:
+            return
+        context.user_data["admin_action"] = f"edit_link:{link_name}"
+        await query.message.reply_text(
+            f"Send the new {labels[link_name]} URL.\n\nSend /cancel to stop."
+        )
+    elif data == "admin_image":
+        chat_id = settings_chat_id(update)
+        if chat_id is None:
+            await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            return
+        _, photo_id = get_settings(chat_id)
+        status = "SET ✅" if photo_id else "NOT SET"
+        await query.message.reply_text(
+            f"🖼 Welcome image\n\nCurrent status: {status}",
+            reply_markup=admin_image_keyboard(),
+        )
+    elif data == "admin_image_set":
+        context.user_data["admin_action"] = "set_image"
+        await query.message.reply_text(
+            "📤 Send the new welcome image now.\n\nSend /cancel to stop."
+        )
+    elif data == "admin_image_clear":
+        chat_id = settings_chat_id(update)
+        if chat_id is None:
+            await query.message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            return
+        save_settings(chat_id, photo_file_id=None, set_photo=True)
+        context.user_data.pop("admin_action", None)
+        await query.message.reply_text(
+            "Welcome image removed.", reply_markup=admin_keyboard()
+        )
+
+async def cancel_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message:
+        return
+    context.user_data.pop("admin_action", None)
+    await update.effective_message.reply_text(
+        "Action cancelled.", reply_markup=admin_keyboard() if is_admin(update) else None
+    )
+
+async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not is_admin(update):
+        return
+    action = context.user_data.get("admin_action")
+    if not action:
+        return
+    value = (message.text or "").strip()
+    if action == "edit_welcome":
+        if len(value) > 1000:
+            await message.reply_text("Please keep the welcome message under 1000 characters.")
+            return
+        chat_id = settings_chat_id(update)
+        if chat_id is None:
+            await message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            return
+        save_settings(chat_id, welcome_text=value)
+        context.user_data.pop("admin_action", None)
+        await message.reply_text(
+            "Welcome template saved ✅", reply_markup=admin_keyboard()
+        )
+    elif action.startswith("edit_link:"):
+        if not value.startswith(("https://", "http://")):
+            await message.reply_text("Please send a complete URL beginning with https://")
+            return
+        chat_id = settings_chat_id(update)
+        if chat_id is None:
+            await message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+            return
+        link_name = action.split(":", 1)[1]
+        save_link(chat_id, link_name, value)
+        context.user_data.pop("admin_action", None)
+        await message.reply_text(
+            "Official link saved ✅", reply_markup=admin_keyboard()
+        )
+
+async def admin_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not is_admin(update):
+        return
+    if context.user_data.get("admin_action") != "set_image":
+        return
+    chat_id = settings_chat_id(update)
+    if chat_id is None:
+        await message.reply_text("Set TARGET_CHAT_ID in Railway Variables first.")
+        return
+    save_settings(chat_id, photo_file_id=message.photo[-1].file_id, set_photo=True)
+    context.user_data.pop("admin_action", None)
+    await message.reply_text(
+        "Welcome image saved ✅", reply_markup=admin_keyboard()
+    )
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message and update.effective_user:
@@ -273,6 +507,7 @@ async def quick_text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     key = raw.lower().strip().strip("!?.,:;()[]{}<> ")
     key = key.lstrip("@#").strip()
+    COMMUNITY_URL, CHANNEL_URL, X_URL, WEBSITE_URL = get_links(chat.id)
     if key == "x":
         await message.reply_text(f"Follow JOBBY on X: {X_URL}", disable_web_page_preview=True)
     elif key == "channel":
@@ -330,7 +565,14 @@ def main():
     app.add_handler(CommandHandler("setphoto", setphoto))
     app.add_handler(CommandHandler("clearphoto", clearphoto))
     app.add_handler(CommandHandler("help", settings_help))
+    app.add_handler(CommandHandler("cancel", cancel_admin_action))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.PHOTO, admin_photo_input
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, admin_text_input
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quick_text_triggers))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_members))
     app.add_handler(ChatMemberHandler(member_status, ChatMemberHandler.CHAT_MEMBER))
