@@ -4,15 +4,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    KeyboardButtonRequestChat,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
@@ -35,7 +27,7 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/JOBBYSOL")
 X_URL = os.getenv("X_URL", "https://x.com/JOBBYSOL")
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://jobby.lol").strip() or "https://jobby.lol"
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
-GROUP_PICKER_REQUEST_ID = 64001
+GLOBAL_SETTINGS_ID = 0
 
 LEGACY_DEFAULT_WELCOME = (
     "Welcome, {name}!\n\n"
@@ -95,26 +87,80 @@ def connect_db():
     conn.commit()
     return conn
 
-def get_settings(chat_id):
+def _legacy_target_id(conn):
+    row = conn.execute(
+        "SELECT config_value FROM bot_config WHERE config_key='target_chat_id'"
+    ).fetchone()
+    if row and str(row[0]).lstrip("-").isdigit():
+        return int(row[0])
+    if TARGET_CHAT_ID.lstrip("-").isdigit():
+        return int(TARGET_CHAT_ID)
+    return None
+
+def get_settings(chat_id=None):
+    """Return the one global welcome template shared by every group."""
     with connect_db() as conn:
         row = conn.execute(
-            "SELECT welcome_text, welcome_html, photo_file_id FROM settings WHERE chat_id=?",
-            (chat_id,),
+            "SELECT welcome_text, welcome_html, photo_file_id "
+            "FROM settings WHERE chat_id=?",
+            (GLOBAL_SETTINGS_ID,),
         ).fetchone()
         if row:
             return row[0], row[1], row[2]
+
+        # Preserve the most recently edited rich template from the old per-chat setup.
+        text_row = conn.execute(
+            "SELECT welcome_text, welcome_html FROM settings "
+            "WHERE chat_id != ? AND welcome_html IS NOT NULL "
+            "ORDER BY rowid DESC LIMIT 1",
+            (GLOBAL_SETTINGS_ID,),
+        ).fetchone()
+        if not text_row:
+            text_row = conn.execute(
+                "SELECT welcome_text, welcome_html FROM settings "
+                "WHERE chat_id != ? AND welcome_text NOT IN (?, ?) "
+                "ORDER BY rowid DESC LIMIT 1",
+                (GLOBAL_SETTINGS_ID, DEFAULT_WELCOME, LEGACY_DEFAULT_WELCOME),
+            ).fetchone()
+
+        legacy_target = _legacy_target_id(conn)
+        if not text_row and legacy_target is not None:
+            text_row = conn.execute(
+                "SELECT welcome_text, welcome_html FROM settings WHERE chat_id=?",
+                (legacy_target,),
+            ).fetchone()
+        if not text_row:
+            text_row = (DEFAULT_WELCOME, None)
+
+        photo_row = None
+        if legacy_target is not None:
+            photo_row = conn.execute(
+                "SELECT photo_file_id FROM settings "
+                "WHERE chat_id=? AND photo_file_id IS NOT NULL",
+                (legacy_target,),
+            ).fetchone()
+        if not photo_row:
+            photo_row = conn.execute(
+                "SELECT photo_file_id FROM settings "
+                "WHERE chat_id != ? AND photo_file_id IS NOT NULL "
+                "ORDER BY rowid DESC LIMIT 1",
+                (GLOBAL_SETTINGS_ID,),
+            ).fetchone()
+        photo = photo_row[0] if photo_row else None
+
         conn.execute(
-            "INSERT OR IGNORE INTO settings"
+            "INSERT INTO settings"
             "(chat_id, welcome_text, welcome_html, photo_file_id) VALUES(?,?,?,?)",
-            (chat_id, DEFAULT_WELCOME, None, None),
+            (GLOBAL_SETTINGS_ID, text_row[0], text_row[1], photo),
         )
         conn.commit()
-        return DEFAULT_WELCOME, None, None
+        return text_row[0], text_row[1], photo
 
 def save_settings(
-    chat_id, welcome_text=None, welcome_html=None, photo_file_id=None, set_photo=False
+    chat_id=None, welcome_text=None, welcome_html=None,
+    photo_file_id=None, set_photo=False
 ):
-    text, formatted, photo = get_settings(chat_id)
+    text, formatted, photo = get_settings()
     if welcome_text is not None:
         text = welcome_text
         formatted = welcome_html
@@ -128,26 +174,42 @@ def save_settings(
             "welcome_text=excluded.welcome_text, "
             "welcome_html=excluded.welcome_html, "
             "photo_file_id=excluded.photo_file_id",
-            (chat_id, text, formatted, photo),
+            (GLOBAL_SETTINGS_ID, text, formatted, photo),
         )
         conn.commit()
 
-def get_links(chat_id):
+def get_links(chat_id=None):
+    """Return the one official-link set shared by every group."""
     with connect_db() as conn:
         row = conn.execute(
-            "SELECT community_url, channel_url, x_url, website_url FROM links WHERE chat_id=?",
-            (chat_id,),
+            "SELECT community_url, channel_url, x_url, website_url "
+            "FROM links WHERE chat_id=?",
+            (GLOBAL_SETTINGS_ID,),
         ).fetchone()
         if row:
             return row
-        defaults = (COMMUNITY_URL, CHANNEL_URL, X_URL, WEBSITE_URL)
+
+        legacy_target = _legacy_target_id(conn)
+        source = None
+        if legacy_target is not None:
+            source = conn.execute(
+                "SELECT community_url, channel_url, x_url, website_url "
+                "FROM links WHERE chat_id=?",
+                (legacy_target,),
+            ).fetchone()
+        if not source:
+            source = conn.execute(
+                "SELECT community_url, channel_url, x_url, website_url "
+                "FROM links WHERE chat_id < 0 ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        values = source or (COMMUNITY_URL, CHANNEL_URL, X_URL, WEBSITE_URL)
         conn.execute(
-            "INSERT OR IGNORE INTO links(chat_id, community_url, channel_url, x_url, website_url) "
+            "INSERT INTO links(chat_id, community_url, channel_url, x_url, website_url) "
             "VALUES(?,?,?,?,?)",
-            (chat_id, *defaults),
+            (GLOBAL_SETTINGS_ID, *values),
         )
         conn.commit()
-        return defaults
+        return values
 
 def save_link(chat_id, link_name, url):
     columns = {
@@ -159,9 +221,12 @@ def save_link(chat_id, link_name, url):
     column = columns.get(link_name)
     if not column:
         raise ValueError("Unknown link name")
-    get_links(chat_id)
+    get_links()
     with connect_db() as conn:
-        conn.execute(f"UPDATE links SET {column}=? WHERE chat_id=?", (url, chat_id))
+        conn.execute(
+            f"UPDATE links SET {column}=? WHERE chat_id=?",
+            (url, GLOBAL_SETTINGS_ID),
+        )
         conn.commit()
 
 def is_admin(update: Update) -> bool:
@@ -169,47 +234,20 @@ def is_admin(update: Update) -> bool:
     return bool(user and user.id in ADMIN_IDS)
 
 def remember_group(chat_id, make_target=False):
+    """Record groups without changing the global welcome configuration."""
     if not isinstance(chat_id, int) or chat_id >= 0:
         return
     with connect_db() as conn:
-        existing = conn.execute(
-            "SELECT config_value FROM bot_config WHERE config_key='target_chat_id'"
-        ).fetchone()
-        if make_target or not existing:
-            conn.execute(
-                "INSERT INTO bot_config(config_key, config_value) "
-                "VALUES('target_chat_id', ?) "
-                "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
-                (str(chat_id),),
-            )
+        conn.execute(
+            "INSERT INTO bot_config(config_key, config_value) VALUES(?, ?) "
+            "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
+            (f"group:{chat_id}", str(chat_id)),
+        )
         conn.commit()
-    get_settings(chat_id)
-    get_links(chat_id)
-
-def configured_group_id():
-    with connect_db() as conn:
-        row = conn.execute(
-            "SELECT config_value FROM bot_config WHERE config_key='target_chat_id'"
-        ).fetchone()
-        if row and str(row[0]).lstrip("-").isdigit():
-            return int(row[0])
-    if TARGET_CHAT_ID.lstrip("-").isdigit():
-        return int(TARGET_CHAT_ID)
-    with connect_db() as conn:
-        row = conn.execute(
-            "SELECT chat_id FROM settings WHERE chat_id < 0 ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            return row[0]
-    return None
 
 def settings_chat_id(update: Update):
-    """Resolve the group edited from the private admin panel."""
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        remember_group(chat.id)
-        return chat.id
-    return configured_group_id()
+    """All admin edits apply to every group through the global settings row."""
+    return GLOBAL_SETTINGS_ID
 
 def make_keyboard(chat_id=None):
     if chat_id is None:
@@ -227,7 +265,6 @@ def make_keyboard(chat_id=None):
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 Select JOBBY group", callback_data="admin_select_group")],
         [InlineKeyboardButton("👁 Preview welcome", callback_data="admin_preview")],
         [InlineKeyboardButton("✏️ Edit welcome template", callback_data="admin_edit_text")],
         [InlineKeyboardButton("🔗 Official links", callback_data="admin_links")],
@@ -251,14 +288,13 @@ def admin_image_keyboard():
     ])
 
 def admin_panel_text():
-    target_status = "SELECTED ✅" if configured_group_id() is not None else "NOT SELECTED"
     return (
         "🔐 JOBBY ADMIN\n\n"
         "Bot status: ONLINE\n"
         "Welcome messages: ON\n"
-        f"Target group: {target_status}\n"
+        "Publishing: ALL GROUPS ✅\n"
         f"Authorized admins: {len(ADMIN_IDS)}\n\n"
-        "All welcome settings can be changed here inside the bot."
+        "Edit once here; every group will use the same welcome."
     )
 
 def render_welcome(welcome_text, welcome_html, member):
@@ -340,7 +376,7 @@ async def send_admin_preview(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = settings_chat_id(update)
     if chat_id is None:
         await query.message.reply_text(
-            "No target group selected. Tap 🎯 Select JOBBY group in the admin panel."
+            "Global welcome settings are ready for all groups."
         )
         return
     welcome_text, welcome_html, photo_id = get_settings(chat_id)
@@ -385,22 +421,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("admin_controls", "admin_back"):
         context.user_data.pop("admin_action", None)
         await query.message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
-    elif data == "admin_select_group":
-        picker = KeyboardButton(
-            "🎯 Choose JOBBY group",
-            request_chat=KeyboardButtonRequestChat(
-                request_id=GROUP_PICKER_REQUEST_ID,
-                chat_is_channel=False,
-                bot_is_member=True,
-            ),
-        )
-        await query.message.reply_text(
-            "Tap the button below, then choose the JOBBY group.\n"
-            "You will not need to leave this bot.",
-            reply_markup=ReplyKeyboardMarkup(
-                [[picker]], resize_keyboard=True, one_time_keyboard=True
-            ),
-        )
     elif data == "admin_preview":
         await send_admin_preview(update, context)
     elif data == "admin_edit_text":
@@ -414,7 +434,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_links":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+            await query.message.reply_text("Global welcome settings are ready for all groups.")
             return
         group_url, channel_url, x_url, website_url = get_links(chat_id)
         await query.message.reply_text(
@@ -444,7 +464,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_image":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+            await query.message.reply_text("Global welcome settings are ready for all groups.")
             return
         _, _, photo_id = get_settings(chat_id)
         status = "SET ✅" if photo_id else "NOT SET"
@@ -460,7 +480,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_image_clear":
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await query.message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+            await query.message.reply_text("Global welcome settings are ready for all groups.")
             return
         save_settings(chat_id, photo_file_id=None, set_photo=True)
         context.user_data.pop("admin_action", None)
@@ -490,7 +510,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+            await message.reply_text("Global welcome settings are ready for all groups.")
             return
         formatted = (message.text_html or value).strip()
         save_settings(chat_id, welcome_text=value, welcome_html=formatted)
@@ -504,7 +524,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         chat_id = settings_chat_id(update)
         if chat_id is None:
-            await message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+            await message.reply_text("Global welcome settings are ready for all groups.")
             return
         link_name = action.split(":", 1)[1]
         save_link(chat_id, link_name, value)
@@ -521,38 +541,13 @@ async def admin_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+        await message.reply_text("Global welcome settings are ready for all groups.")
         return
     save_settings(chat_id, photo_file_id=message.photo[-1].file_id, set_photo=True)
     context.user_data.pop("admin_action", None)
     await message.reply_text(
         "Welcome image saved ✅", reply_markup=admin_keyboard()
     )
-
-async def selected_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message or not message.chat_shared or not is_admin(update):
-        return
-    shared = message.chat_shared
-    if shared.request_id != GROUP_PICKER_REQUEST_ID:
-        return
-    try:
-        chosen_chat = await context.bot.get_chat(shared.chat_id)
-    except Exception:
-        log.exception("Could not access selected target group %s", shared.chat_id)
-        await message.reply_text(
-            "I could not access that group. Add this bot to the group, then select it again.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-    remember_group(shared.chat_id, make_target=True)
-    context.user_data.pop("admin_action", None)
-    title = chosen_chat.title or str(shared.chat_id)
-    await message.reply_text(
-        f"Target group selected: {title} ✅",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await message.reply_text(admin_panel_text(), reply_markup=admin_keyboard())
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message and update.effective_user:
@@ -576,7 +571,7 @@ async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+        await update.effective_message.reply_text("Global welcome settings are ready for all groups.")
         return
     save_settings(chat_id, welcome_text=new_text)
     await update.effective_message.reply_text("Welcome message saved for this group.")
@@ -596,7 +591,7 @@ async def setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+        await update.effective_message.reply_text("Global welcome settings are ready for all groups.")
         return
     save_settings(
         chat_id,
@@ -613,7 +608,7 @@ async def clearphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = settings_chat_id(update)
     if chat_id is None:
-        await update.effective_message.reply_text("No target group selected. Tap 🎯 Select JOBBY group in the admin panel.")
+        await update.effective_message.reply_text("Global welcome settings are ready for all groups.")
         return
     save_settings(chat_id, photo_file_id=None, set_photo=True)
     await update.effective_message.reply_text("Welcome image removed for this group.")
@@ -690,9 +685,6 @@ def main():
     app.add_handler(CommandHandler("help", settings_help))
     app.add_handler(CommandHandler("cancel", cancel_admin_action))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(
-        filters.StatusUpdate.CHAT_SHARED, selected_group
-    ))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.PHOTO, admin_photo_input
     ))
