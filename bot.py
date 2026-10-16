@@ -168,28 +168,34 @@ def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
 
-def remember_group(chat_id):
+def remember_group(chat_id, make_target=False):
     if not isinstance(chat_id, int) or chat_id >= 0:
         return
     with connect_db() as conn:
-        conn.execute(
-            "INSERT INTO bot_config(config_key, config_value) VALUES('target_chat_id', ?) "
-            "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
-            (str(chat_id),),
-        )
+        existing = conn.execute(
+            "SELECT config_value FROM bot_config WHERE config_key='target_chat_id'"
+        ).fetchone()
+        if make_target or not existing:
+            conn.execute(
+                "INSERT INTO bot_config(config_key, config_value) "
+                "VALUES('target_chat_id', ?) "
+                "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
+                (str(chat_id),),
+            )
         conn.commit()
     get_settings(chat_id)
     get_links(chat_id)
 
 def configured_group_id():
-    if TARGET_CHAT_ID.lstrip("-").isdigit():
-        return int(TARGET_CHAT_ID)
     with connect_db() as conn:
         row = conn.execute(
             "SELECT config_value FROM bot_config WHERE config_key='target_chat_id'"
         ).fetchone()
         if row and str(row[0]).lstrip("-").isdigit():
             return int(row[0])
+    if TARGET_CHAT_ID.lstrip("-").isdigit():
+        return int(TARGET_CHAT_ID)
+    with connect_db() as conn:
         row = conn.execute(
             "SELECT chat_id FROM settings WHERE chat_id < 0 ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
@@ -539,7 +545,7 @@ async def selected_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove(),
         )
         return
-    remember_group(shared.chat_id)
+    remember_group(shared.chat_id, make_target=True)
     context.user_data.pop("admin_action", None)
     title = chosen_chat.title or str(shared.chat_id)
     await message.reply_text(
