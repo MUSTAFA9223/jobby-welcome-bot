@@ -275,8 +275,8 @@ class StatsUI:
             if chat_id not in groups:
                 await query.message.reply_text("Group is not registered.")
                 return
-            await self.send_board(
-                query.message, chat_id, period, page, chat_id,
+            await self.edit_board(
+                query, chat_id, period, page, chat_id,
                 groups[chat_id], True,
             )
 
