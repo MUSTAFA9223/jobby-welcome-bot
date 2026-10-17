@@ -283,10 +283,10 @@ class StatsUI:
 
 def register(app, connect_db, remember_group, admin_ids):
     handlers = StatsUI(connect_db, remember_group, admin_ids)
-    app.add_handler(CommandHandler(["top", "rank", "leaderboard"], handlers.top))
+    app.add_handler(CommandHandler("top", handlers.top))
     app.add_handler(CommandHandler(["stats", "mystats"], handlers.personal))
     app.add_handler(CallbackQueryHandler(
-        handlers.callbacks, pattern=r"^(stats_lb:|stats_admin$|stats_group:)"
+        handlers.callbacks, pattern=r"^stats_lb:"
     ))
     # Independent group ensures shortcut reply handlers still run.
     app.add_handler(MessageHandler(
