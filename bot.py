@@ -325,7 +325,6 @@ def admin_keyboard():
         [InlineKeyboardButton("🔗 Official links", callback_data="admin_links")],
         [InlineKeyboardButton("🖼 Welcome image", callback_data="admin_image")],
         [InlineKeyboardButton("⚡ Custom shortcuts", callback_data="admin_shortcuts")],
-        [InlineKeyboardButton("🏆 Message leaderboard", callback_data="stats_admin")],
     ])
 
 def admin_shortcuts_keyboard():
