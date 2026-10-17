@@ -16,6 +16,7 @@ A Telegram group welcome bot for JOBBY. It greets new members by display name, o
 
 - `TELEGRAM_BOT_TOKEN` (required)
 - `ADMIN_IDS` (comma-separated Telegram numeric IDs)
+- `OWNER_ID` (optional Telegram numeric user ID; strongly recommended if ADMIN_IDS contains more than one ID)
 - `DB_PATH` (defaults to `/data/jobby-welcome-bot.sqlite3`)
 - `COMMUNITY_URL`, `CHANNEL_URL`, `X_URL` (defaults are JOBBY links)
 - `WEBSITE_URL` (optional; leave empty until the official site URL is confirmed)
@@ -34,7 +35,8 @@ The bot uses long polling and Railway's restart-on-failure policy. This reduces 
 
 - `/stats` (in a group) — see your messages today (UTC), over the last 7 days, this month, and all time, plus your position.
 - Reply to a member's message with `/stats` to inspect that member's count.
-- `/top` — on-demand leaderboard of **all recorded members** in this group, with names, usernames, message counts and ranking. It is **only posted when a member types `/top`**; it is never posted automatically and has no separate admin-panel trigger. Use the period and page buttons on that message to navigate.
+- `/top` — on-demand leaderboard of **all recorded members** in this group, with names, usernames, message counts and ranking. **Only the bot owner may call this command or use its period/page buttons.** Non-owner calls are ignored. It is never posted automatically.
+- The owner is `OWNER_ID` when configured; otherwise, the sole user in `ADMIN_IDS` is the owner. If multiple admins are configured and no `OWNER_ID` is set, `/top` stays locked for everyone until the owner is explicitly configured. The shared leaderboard message remains visible to all group members once the owner posts it; Telegram cannot selectively hide its inline buttons from individual members.
 
 Counts are **independent for each group**. The bot counts new text and media messages from human users; bot messages, Telegram service events, and message edits are excluded. Duplicate message deliveries are ignored through a persistent ID table. Time windows use UTC, and weekly totals cover today plus the six preceding calendar days. No retroactive counting is possible.
 
