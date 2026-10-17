@@ -5,6 +5,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+import message_stats
+import message_stats_ui
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
@@ -88,6 +91,7 @@ def connect_db():
             response_html TEXT
         )
     """)
+    message_stats.ensure_schema(conn)
     # Upgrade only the original stock message; preserve admin-customized text.
     conn.execute(
         "UPDATE settings SET welcome_text=? WHERE welcome_text=?",
@@ -276,7 +280,7 @@ def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
 
-def remember_group(chat_id, make_target=False):
+def remember_group(chat_id, make_target=False, title=None):
     """Record groups without changing the global welcome configuration."""
     if not isinstance(chat_id, int) or chat_id >= 0:
         return
@@ -286,6 +290,12 @@ def remember_group(chat_id, make_target=False):
             "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
             (f"group:{chat_id}", str(chat_id)),
         )
+        if title:
+            conn.execute(
+                "INSERT INTO bot_config(config_key,config_value) VALUES(?,?) "
+                "ON CONFLICT(config_key) DO UPDATE SET config_value=excluded.config_value",
+                (f"group_title:{chat_id}", title),
+            )
         conn.commit()
 
 def settings_chat_id(update: Update):
@@ -313,6 +323,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🔗 Official links", callback_data="admin_links")],
         [InlineKeyboardButton("🖼 Welcome image", callback_data="admin_image")],
         [InlineKeyboardButton("⚡ Custom shortcuts", callback_data="admin_shortcuts")],
+        [InlineKeyboardButton("🏆 Message leaderboard", callback_data="stats_admin")],
     ])
 
 def admin_shortcuts_keyboard():
@@ -434,7 +445,7 @@ async def new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
         return
-    remember_group(message.chat_id)
+    remember_group(message.chat_id, title=message.chat.title)
     for member in message.new_chat_members or []:
         if context.bot and member.id == context.bot.id:
             continue
@@ -445,7 +456,7 @@ async def member_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not change or not chat:
         return
-    remember_group(chat.id)
+    remember_group(chat.id, title=chat.title)
     old = change.old_chat_member
     new = change.new_chat_member
     if old.status in ("left", "kicked") and new.status in (
@@ -789,7 +800,7 @@ async def quick_text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = update.effective_chat
     if not message or not chat or chat.type not in ("group", "supergroup"):
         return
-    remember_group(chat.id)
+    remember_group(chat.id, title=chat.title)
     raw = (message.text or "").strip()
     if not raw:
         return
@@ -863,6 +874,7 @@ def main():
     app.add_handler(CommandHandler("clearphoto", clearphoto))
     app.add_handler(CommandHandler("help", settings_help))
     app.add_handler(CommandHandler("cancel", cancel_admin_action))
+    message_stats_ui.register(app, connect_db, remember_group, ADMIN_IDS)
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.PHOTO, admin_photo_input
