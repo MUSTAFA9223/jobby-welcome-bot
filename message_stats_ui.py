@@ -103,6 +103,17 @@ class StatsUI:
         self.connect_db = connect_db
         self.remember_group = remember_group
         self.admin_ids = admin_ids
+        # OWNER_ID is optional. With exactly one ADMIN_IDS entry that user is
+        # the owner; if multiple admins are configured, require explicit OWNER_ID.
+        import os
+        configured = os.getenv("OWNER_ID", "").strip()
+        self.owner_id = (
+            int(configured) if configured.isdigit() else
+            next(iter(admin_ids)) if len(admin_ids) == 1 else None
+        )
+
+    def is_owner(self, user):
+        return bool(user and self.owner_id and user.id == self.owner_id)
 
     def known_groups(self):
         with self.connect_db() as conn:
@@ -184,6 +195,9 @@ class StatsUI:
             message_stats.record(conn, chat.id, message)
 
     async def top(self, update, context):
+        # Never reveal the leaderboard when a non-owner tries the command.
+        if not self.is_owner(update.effective_user):
+            return
         message, chat = update.effective_message, update.effective_chat
         if not message or not chat or chat.type not in ("group", "supergroup"):
             return
@@ -217,6 +231,9 @@ class StatsUI:
         query = update.callback_query
         if not query:
             return
+        if not self.is_owner(query.from_user):
+            await query.answer("لوحة الصدارة مخصصة لمالك البوت فقط.", show_alert=True)
+            return
         await query.answer()
         action = query.data or ""
         if action.startswith("stats_lb:"):
@@ -236,9 +253,6 @@ class StatsUI:
             await self.edit_board(query, chat.id, period, page)
             return
 
-        if query.from_user.id not in self.admin_ids:
-            await query.message.reply_text("Admin access required.")
-            return
         if action == "stats_admin":
             groups = self.known_groups()
             if not groups:
