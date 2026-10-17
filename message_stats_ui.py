@@ -1,4 +1,4 @@
-"""Telegram commands and admin controls for per-group message leaderboards."""
+"""Telegram commands and admin controls for complete, formatted message leaderboards."""
 import html
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -7,18 +7,95 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, f
 
 import message_stats
 
+# Telegram text messages have a 4096-character limit. Keep a safe margin for
+# HTML tags, display names and optional animated emoji entities.
+MAX_BOARD_CHARS = 3400
 
-def periods(prefix="stats_lb", group_id=None):
-    def payload(p):
-        return f"{prefix}:{group_id}:{p}" if group_id is not None else f"{prefix}:{p}"
+# Public Telegram custom-emoji IDs; ordinary emoji are always usable as fallback.
+# Animated custom emoji appears only when Telegram allows this bot to send it.
+TOP_MEDALS = (
+    ("🏆", "5409008750893734809"),
+    ("🥈", "5447203607294265305"),
+    ("🥉", "5453902265922376865"),
+)
+
+
+def medal(position, animated=True):
+    if position > 3:
+        return f"{position}."
+    fallback, custom_id = TOP_MEDALS[position - 1]
+    if animated:
+        return f'<tg-emoji emoji-id="{custom_id}">{fallback}</tg-emoji>'
+    return fallback
+
+
+def periods(prefix="stats_lb", group_id=None, period="all", page=0, page_count=1):
+    def payload(p, index=0):
+        if group_id is None:
+            return f"{prefix}:{p}:{index}"
+        return f"{prefix}:{group_id}:{p}:{index}"
+
     rows = [[
         InlineKeyboardButton("📅 Today", callback_data=payload("today")),
         InlineKeyboardButton("📈 7 days", callback_data=payload("week")),
         InlineKeyboardButton("🏆 All time", callback_data=payload("all")),
     ]]
+    if page_count > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=payload(period, page - 1)))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data=payload(period, page)))
+        if page < page_count - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=payload(period, page + 1)))
+        rows.append(nav)
     if group_id is not None:
         rows.append([InlineKeyboardButton("⬅️ Groups", callback_data="stats_admin")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_pages(records, period="all", title=None, summary=None, animated=True):
+    periods_text = {
+        "all": "All time", "today": "Today (UTC)",
+        "week": "Last 7 days (UTC)"
+    }
+    group_name = f" — {html.escape(title)}" if title else ""
+    heading = (
+        f"<b>🏆 JOBBY MESSAGE LEADERBOARD{group_name}</b>\n"
+        f"<b>📊 {periods_text.get(period, 'All time')}</b>"
+    )
+    if summary:
+        heading += f"\n<b>{html.escape(summary)}</b>"
+    footer = "<i>Counting began when message tracking was enabled.</i>"
+    rows = []
+    for position, (uid, name, username, count) in enumerate(records, 1):
+        safe_name = html.escape(name or username or str(uid))
+        handle = f" (@{html.escape(username)})" if username else ""
+        rows.append(
+            f'<b>{medal(position, animated)} '
+            f'<a href="tg://user?id={uid}">{safe_name}</a>'
+            f'{handle} — {count:,} messages</b>'
+        )
+    if not rows:
+        rows = ["<b>No messages recorded for this period yet.</b>"]
+
+    pages = []
+    current = []
+    length = len(heading) + len(footer) + 90
+    for row in rows:
+        if current and length + len(row) + 2 > MAX_BOARD_CHARS:
+            pages.append(current)
+            current = []
+            length = len(heading) + len(footer) + 90
+        current.append(row)
+        length += len(row) + 2
+    if current:
+        pages.append(current)
+
+    result = []
+    for idx, batch in enumerate(pages):
+        page_label = f"\n<b>Page {idx + 1} of {len(pages)}</b>" if len(pages) > 1 else ""
+        result.append(f"{heading}{page_label}\n\n" + "\n".join(batch) + f"\n\n{footer}")
+    return result
 
 
 class StatsUI:
@@ -39,26 +116,66 @@ class StatsUI:
         return [(int(gid), titles.get(gid, f"Group {gid}")) for gid in ids
                 if gid.lstrip("-").isdigit()]
 
-    def board(self, chat_id, period="all", title=None):
+    def board(self, chat_id, period="all", page=0, title=None, admin=False, animated=True):
         with self.connect_db() as conn:
             records = message_stats.leaders(conn, chat_id, period)
-        periods_text = {"all": "All time", "today": "Today (UTC)",
-                        "week": "Last 7 days (UTC)"}
-        suffix = f" — {html.escape(title)}" if title else ""
-        lines = [f"🏆 JOBBY Message Leaderboard{suffix}",
-                 f"📊 {periods_text.get(period, 'All time')}", ""]
-        for position, (uid, name, username, n) in enumerate(records, 1):
-            label = html.escape(name or username or str(uid))
-            lines.append(
-                f'{position}. <a href="tg://user?id={uid}">{label}</a> — {n:,} messages'
+            members, total = message_stats.summary(conn, chat_id) if admin else (0, 0)
+        summary = f"{members:,} tracked members · {total:,} total messages" if admin else None
+        pages = build_pages(records, period, title, summary, animated)
+        page = max(0, min(page, len(pages) - 1))
+        return pages[page], page, len(pages)
+
+    async def send_board(self, message, chat_id, period="all", page=0,
+                         group_id=None, title=None, admin=False):
+        text, page, count = self.board(chat_id, period, page, title, admin)
+        markup = periods("stats_group" if admin else "stats_lb", group_id,
+                         period, page, count)
+        try:
+            await message.reply_text(
+                text, parse_mode="HTML", reply_markup=markup,
+                disable_web_page_preview=True,
             )
-        if not records:
-            lines.append("No messages counted for this period yet.")
-        lines += ["", "Counting began when this feature was activated."]
-        return "\n".join(lines)
+        except BadRequest:
+            if "<tg-emoji" not in text:
+                raise
+            # Some Telegram bots cannot send custom emoji: retry with static medals.
+            text, page, count = self.board(chat_id, period, page, title, admin, False)
+            markup = periods("stats_group" if admin else "stats_lb", group_id,
+                             period, page, count)
+            await message.reply_text(
+                text, parse_mode="HTML", reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+
+    async def edit_board(self, query, chat_id, period="all", page=0,
+                         group_id=None, title=None, admin=False):
+        text, page, count = self.board(chat_id, period, page, title, admin)
+        markup = periods("stats_group" if admin else "stats_lb", group_id,
+                         period, page, count)
+        try:
+            await query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+            if "<tg-emoji" not in text:
+                raise
+            text, page, count = self.board(chat_id, period, page, title, admin, False)
+            markup = periods("stats_group" if admin else "stats_lb", group_id,
+                             period, page, count)
+            try:
+                await query.edit_message_text(
+                    text, parse_mode="HTML", reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as retry_exc:
+                if "not modified" not in str(retry_exc).lower():
+                    raise
 
     async def count(self, update, context):
-        # update.message is absent on edited messages, so edits are not counted.
+        # Edited messages are excluded: they don't contain update.message.
         message, chat = update.message, update.effective_chat
         if not message or not chat or chat.type not in ("group", "supergroup"):
             return
@@ -71,10 +188,7 @@ class StatsUI:
         if not message or not chat or chat.type not in ("group", "supergroup"):
             return
         self.remember_group(chat.id, title=chat.title)
-        await message.reply_text(
-            self.board(chat.id), parse_mode="HTML", reply_markup=periods(),
-            disable_web_page_preview=True,
-        )
+        await self.send_board(message, chat.id)
 
     async def personal(self, update, context):
         message, chat = update.effective_message, update.effective_chat
@@ -106,20 +220,20 @@ class StatsUI:
         await query.answer()
         action = query.data or ""
         if action.startswith("stats_lb:"):
-            period = action.split(":", 1)[1]
+            pieces = action.split(":")
+            if len(pieces) not in (2, 3):
+                return
+            period = pieces[1]
+            try:
+                page = int(pieces[2]) if len(pieces) == 3 else 0
+            except ValueError:
+                return
             chat = query.message.chat if query.message else None
             if period not in ("all", "today", "week") or not chat:
                 return
             if chat.type not in ("group", "supergroup"):
                 return
-            try:
-                await query.edit_message_text(
-                    self.board(chat.id, period), parse_mode="HTML",
-                    reply_markup=periods(), disable_web_page_preview=True,
-                )
-            except BadRequest as exc:
-                if "not modified" not in str(exc).lower():
-                    raise
+            await self.edit_board(query, chat.id, period, page)
             return
 
         if query.from_user.id not in self.admin_ids:
@@ -134,7 +248,7 @@ class StatsUI:
                 return
             buttons = [
                 [InlineKeyboardButton(label[:48],
-                 callback_data=f"stats_group:{gid}:all")]
+                 callback_data=f"stats_group:{gid}:all:0")]
                 for gid, label in groups[:40]
             ]
             buttons.append(
@@ -146,25 +260,24 @@ class StatsUI:
             )
             return
         if action.startswith("stats_group:"):
-            try:
-                chat_id, period = action[len("stats_group:"):].split(":", 1)
-                chat_id = int(chat_id)
-            except (ValueError, TypeError):
+            parts = action.split(":")
+            if len(parts) not in (3, 4):
                 return
+            try:
+                chat_id = int(parts[1])
+                page = int(parts[3]) if len(parts) == 4 else 0
+            except ValueError:
+                return
+            period = parts[2]
             if period not in ("all", "today", "week"):
                 return
             groups = dict(self.known_groups())
             if chat_id not in groups:
                 await query.message.reply_text("Group is not registered.")
                 return
-            with self.connect_db() as conn:
-                members, total = message_stats.summary(conn, chat_id)
-            await query.message.reply_text(
-                f"📊 {members:,} members · {total:,} messages\n\n"
-                + self.board(chat_id, period, groups[chat_id]),
-                parse_mode="HTML",
-                reply_markup=periods("stats_group", chat_id),
-                disable_web_page_preview=True,
+            await self.send_board(
+                query.message, chat_id, period, page, chat_id,
+                groups[chat_id], True,
             )
 
 
