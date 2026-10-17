@@ -79,23 +79,29 @@ def record(conn, chat_id, message):
     return True
 
 
-def leaders(conn, chat_id, period="all", limit=10):
+def leaders(conn, chat_id, period="all", limit=None):
+    """Return every tracked sender by default; optionally restrict row count."""
     since = start_day(period)
     if since is None:
-        return conn.execute(
+        query = (
             "SELECT user_id,display_name,username,total FROM message_counts "
-            "WHERE chat_id=? AND total>0 ORDER BY total DESC,user_id LIMIT ?",
-            (chat_id, limit),
-        ).fetchall()
-    return conn.execute(
-        "SELECT c.user_id,c.display_name,c.username,SUM(d.count) AS n "
-        "FROM message_counts_daily d JOIN message_counts c "
-        "ON c.chat_id=d.chat_id AND c.user_id=d.user_id "
-        "WHERE d.chat_id=? AND d.day_utc>=? "
-        "GROUP BY c.user_id,c.display_name,c.username "
-        "ORDER BY n DESC,c.user_id LIMIT ?",
-        (chat_id, since, limit),
-    ).fetchall()
+            "WHERE chat_id=? AND total>0 ORDER BY total DESC,user_id"
+        )
+        params = [chat_id]
+    else:
+        query = (
+            "SELECT c.user_id,c.display_name,c.username,SUM(d.count) AS n "
+            "FROM message_counts_daily d JOIN message_counts c "
+            "ON c.chat_id=d.chat_id AND c.user_id=d.user_id "
+            "WHERE d.chat_id=? AND d.day_utc>=? "
+            "GROUP BY c.user_id,c.display_name,c.username "
+            "ORDER BY n DESC,c.user_id"
+        )
+        params = [chat_id, since]
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(query, params).fetchall()
 
 
 def personal(conn, chat_id, user_id):
