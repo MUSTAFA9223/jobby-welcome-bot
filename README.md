@@ -34,8 +34,7 @@ The bot uses long polling and Railway's restart-on-failure policy. This reduces 
 
 - `/stats` (in a group) — see your messages today (UTC), over the last 7 days, this month, and all time, plus your position.
 - Reply to a member's message with `/stats` to inspect that member's count.
-- `/top`, `/rank`, or `/leaderboard` — top 10 members in this group, with buttons for today, the last 7 days, or all time.
-- **Message leaderboard** in the private admin panel (`/start`) — select a group and view its leaderboard.
+- `/top` — on-demand leaderboard of **all recorded members** in this group, with names, usernames, message counts and ranking. It is **only posted when a member types `/top`**; it is never posted automatically and has no separate admin-panel trigger. Use the period and page buttons on that message to navigate.
 
 Counts are **independent for each group**. The bot counts new text and media messages from human users; bot messages, Telegram service events, and message edits are excluded. Duplicate message deliveries are ignored through a persistent ID table. Time windows use UTC, and weekly totals cover today plus the six preceding calendar days. No retroactive counting is possible.
 
