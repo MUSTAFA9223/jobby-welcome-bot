@@ -9,6 +9,8 @@ A Telegram group welcome bot for JOBBY. It greets new members by display name, o
 3. Set `ADMIN_IDS` to comma-separated numeric Telegram user IDs. Use `/myid` in a private chat with the bot to find an ID, then add it to Railway Variables and redeploy.
 4. Add a Railway Volume mounted at `/data`, and keep `DB_PATH=/data/jobby-welcome-bot.sqlite3` so per-group settings survive redeploys.
 5. Add the bot to the group and grant permission to send messages.
+6. **For message counts**, allow the bot to read all group messages: make it a group administrator or disable Group Privacy through @BotFather (`/setprivacy`), then remove and re-add the bot if required. Otherwise it may only see commands and replies.
+7. Message totals are recorded from the time this version starts receiving group messages; Telegram does not provide older group history to bots.
 
 ## Variables
 
@@ -27,3 +29,14 @@ A Telegram group welcome bot for JOBBY. It greets new members by display name, o
 - `/help` — list commands.
 
 The bot uses long polling and Railway's restart-on-failure policy. This reduces downtime but cannot guarantee uninterrupted operation. Configure `ADMIN_IDS` before relying on admin commands.
+
+## Message counts and leaderboard
+
+- `/stats` (in a group) — see your messages today (UTC), over the last 7 days, this month, and all time, plus your position.
+- Reply to a member's message with `/stats` to inspect that member's count.
+- `/top`, `/rank`, or `/leaderboard` — top 10 members in this group, with buttons for today, the last 7 days, or all time.
+- **Message leaderboard** in the private admin panel (`/start`) — select a group and view its leaderboard.
+
+Counts are **independent for each group**. The bot counts new text and media messages from human users; bot messages, Telegram service events, and message edits are excluded. Duplicate message deliveries are ignored through a persistent ID table. Time windows use UTC, and weekly totals cover today plus the six preceding calendar days. No retroactive counting is possible.
+
+**Persistence:** the `message_counts`, `message_counts_daily` and `counted_message_ids` tables are in the same SQLite database as the welcome settings. Attach a persistent Railway volume to `/data` before deploying, otherwise a restart may erase counts. Existing welcome text, image and shortcuts are preserved.
